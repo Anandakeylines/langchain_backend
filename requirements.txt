@@ -23,12 +23,11 @@ tiktoken==0.7.0
 # ---------------- PDF Processing ----------------
 pypdf==4.3.1
 
-# ---------------- Vector Store ----------------
-faiss-cpu==1.8.0.post1
+# ---------------- Vector Store (optional) ----------------
+faiss-cpu==1.12.0   # ✅ compatible with Python 3.12
+# or remove this line entirely if using only MongoDB-based embeddings
 
 # ---------------- Misc / Utility ----------------
 requests==2.32.3
 typing-extensions==4.12.2
-
-# ---------------- (Optional for local dev) ----------------
 httpx==0.27.2
