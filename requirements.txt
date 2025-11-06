@@ -18,15 +18,13 @@ langchain-community==0.2.12
 langchain-openai==0.1.17
 langchain-text-splitters==0.2.2
 openai==1.50.2
-tiktoken==0.7.0
-
+tiktoken==0.6.0    # ✅ stable prebuilt wheel for Render
 
 # ---------------- PDF Processing ----------------
 pypdf==4.3.1
 
 # ---------------- Vector Store (optional) ----------------
-faiss-cpu==1.12.0   # ✅ compatible with Python 3.12
-# or remove this line entirely if using only MongoDB-based embeddings
+faiss-cpu==1.12.0
 
 # ---------------- Misc / Utility ----------------
 requests==2.32.3
