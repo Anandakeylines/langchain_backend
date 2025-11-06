@@ -13,12 +13,13 @@ scikit-learn==1.5.2
 
 # ---------------- LangChain & AI ----------------
 langchain==0.2.14
+langchain-core==0.2.32
 langchain-community==0.2.12
-langchain-core==0.2.29
 langchain-openai==0.1.17
 langchain-text-splitters==0.2.2
 openai==1.50.2
 tiktoken==0.7.0
+
 
 # ---------------- PDF Processing ----------------
 pypdf==4.3.1
