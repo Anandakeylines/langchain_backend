@@ -2,7 +2,7 @@
 fastapi==0.115.2
 uvicorn==0.31.0
 python-multipart==0.0.9
-pydantic==2.8.2
+pydantic[email]==2.8.2     # ✅ includes email-validator automatically
 python-dotenv==1.0.1
 passlib[bcrypt]==1.7.4
 python-jose==3.3.0
@@ -18,7 +18,7 @@ langchain-community==0.2.12
 langchain-openai==0.1.17
 langchain-text-splitters==0.2.2
 openai==1.50.2
-#tiktoken==0.6.0    # ✅ stable prebuilt wheel for Render
+#tiktoken==0.6.0
 
 # ---------------- PDF Processing ----------------
 pypdf==4.3.1
