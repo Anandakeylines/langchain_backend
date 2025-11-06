@@ -2,14 +2,16 @@
 fastapi==0.115.2
 uvicorn==0.31.0
 python-multipart==0.0.9
-pydantic[email]==2.8.2     # ✅ includes email-validator automatically
+pydantic[email]==2.8.2
 python-dotenv==1.0.1
-passlib[bcrypt]==1.7.4
+bcrypt==4.0.1                 # ✅ stable version (fixes __about__ error)
+passlib[bcrypt]==1.7.4        # ✅ works with bcrypt 4.0.1
 python-jose==3.3.0
 motor==3.5.1
 pymongo==4.8.0
 numpy==1.26.4
 scikit-learn==1.5.2
+
 
 # ---------------- LangChain & AI ----------------
 langchain==0.2.14
