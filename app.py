@@ -234,62 +234,101 @@ async def chat_with_pdf(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    User asks question -> if it's small talk, respond directly.
-    Else, retrieve embeddings for selected PDF -> chat.
+    Steps:
+      - Handle small-talk greetings instantly
+      - Load stored chunks + embeddings for pdf_id
+      - Embed question using user's OpenAI API key
+      - Retrieve top-k chunks (cosine similarity)
+      - Call LLM (ChatOpenAI) using user's key
+      - Save chat history
     """
+
+    user_api_key = current_user.get("openai_api_key")
+    if not user_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="❌ OpenAI API key missing. Please add it in API Settings."
+        )
+
+    # 🗣️ Step 1: Handle small talk (hi, hello, ok, thanks, etc.)
+    lower_q = question.lower().strip()
+    casual_replies = {
+        "hi": "Hey there! 👋 How can I help you today?",
+        "hello": "Hello! 😊 Ask me anything about your document.",
+        "hey": "Hey! What would you like to explore today?",
+        "thanks": "You're very welcome! 🙏",
+        "thank you": "Happy to help! 🤝",
+        "ok": "Alright 👍",
+        "good morning": "Good morning ☀️ Ready to learn something new?",
+        "good night": "Good night 🌙 Sleep well!",
+        "how are you": "I'm just lines of code, but I'm doing great! How about you?",
+    }
+
+    for key, reply in casual_replies.items():
+        if key in lower_q:
+            return {"question": question, "answer": reply}
+
+    # 🧠 Step 2: Fetch PDF document
+    pdf_doc = await embedding_collection.find_one({
+        "_id": ObjectId(pdf_id),
+        "user_id": str(current_user["_id"])
+    })
+    if not pdf_doc:
+        raise HTTPException(status_code=404, detail="PDF not found for this user")
+
+    chunks = pdf_doc.get("chunks", [])
+    embeddings = np.array(pdf_doc.get("embeddings", []))
+    if embeddings.size == 0:
+        raise HTTPException(status_code=500, detail="No embeddings found for this document")
+
     try:
-        # 💬 1. Handle greetings and casual talk directly
-        lower_q = question.lower().strip()
-        common_phrases = {
-            "hi": "Hey there! 👋 How can I help you today?",
-            "hello": "Hello! 😊 Ask me anything about your document.",
-            "hey": "Hey! What would you like to know?",
-            "thanks": "You're very welcome! 🙏",
-            "thank you": "Happy to help! 🤝",
-            "ok": "Alright 👍",
-            "good morning": "Good morning! ☀️",
-            "good night": "Good night! 🌙",
-        }
-        for key, reply in common_phrases.items():
-            if key in lower_q:
-                return {"question": question, "answer": reply}
+        # 🔍 Step 3: Embed question with user's key
+        embeddings_client = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            api_key=user_api_key
+        )
+        query_emb = embeddings_client.embed_query(question)
 
-        # 🧩 2. Retrieve PDF embeddings as before
-        pdf_data = await embedding_collection.find_one({
-            "_id": ObjectId(pdf_id),
-            "user_id": str(current_user["_id"])
-        })
-        if not pdf_data:
-            raise HTTPException(status_code=404, detail="PDF not found for this user")
+        # 📏 Step 4: Compute cosine similarity
+        sims = cosine_similarity([query_emb], embeddings)[0]
+        top_k = 3
+        idxs = np.argsort(sims)[-top_k:][::-1]
+        context = "\n\n".join([chunks[i] for i in idxs])
+        max_sim = float(np.max(sims)) if len(sims) else 0.0
 
-        chunks = pdf_data["chunks"]
-        embeddings = np.array(pdf_data["embeddings"])
+        # 🧠 Step 5: Handle irrelevant questions (low similarity)
+        if max_sim < 0.25:
+            return {
+                "question": question,
+                "answer": "🤔 That question doesn’t seem related to your document. Try asking something based on its content!"
+            }
 
-        # 🧠 3. Embed the question
-        query_embedding = OpenAIEmbeddings(model="text-embedding-3-small").embed_query(question)
-        similarities = cosine_similarity([query_embedding], embeddings)[0]
-        top_indices = np.argsort(similarities)[-3:][::-1]
-        context = "\n\n".join([chunks[i] for i in top_indices])
+        # 💬 Step 6: Generate response using LLM
+        llm = ChatOpenAI(
+            api_key=user_api_key,
+            model="gpt-4o-mini",
+            temperature=0.2
+        )
 
-        # 🧠 4. Generate intelligent answer
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
         prompt = PromptTemplate(
-            template="""You are a helpful assistant.
-            Answer based ONLY on the context below. If unrelated, politely say you don’t know.
+            template="""
+You are a helpful assistant. Use the provided context to answer the user's question.
+If the answer isn't in the context, politely say you don't know.
 
-            Context:
-            {context}
+Context:
+{context}
 
-            Question:
-            {question}
-            """,
+Question:
+{question}
+""",
             input_variables=["context", "question"]
         )
 
         final_prompt = prompt.format(context=context, question=question)
-        answer = llm.invoke(final_prompt).content.strip()
+        llm_resp = llm.invoke(final_prompt)
+        answer = getattr(llm_resp, "content", None) or str(llm_resp)
 
-        # 💾 5. Save chat history
+        # 💾 Step 7: Save chat history
         await chat_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "pdf_id": pdf_id,
@@ -298,11 +337,12 @@ async def chat_with_pdf(
             "timestamp": datetime.utcnow()
         })
 
-        return {"question": question, "answer": answer or "Sorry, I couldn't find that in the document."}
+        return {"question": question, "answer": answer}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------- chat history ----------------
