@@ -228,62 +228,68 @@ async def get_user_pdfs(current_user: dict = Depends(get_current_user)):
 
 # ---------------- chat with selected pdf ----------------
 @app.post("/chat")
-async def chat_with_pdf(question: str = Form(...), pdf_id: str = Form(...), current_user: dict = Depends(get_current_user)):
+async def chat_with_pdf(
+    question: str = Form(...),
+    pdf_id: str = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
     """
-    Steps:
-      - load stored chunks+embeddings for pdf_id
-      - embed question using user's key
-      - retrieve top-k chunks (cosine)
-      - call LLM (ChatOpenAI) using user's key with prompt + context
-      - save chat history
+    User asks question -> if it's small talk, respond directly.
+    Else, retrieve embeddings for selected PDF -> chat.
     """
-    user_api_key = current_user.get("openai_api_key")
-    if not user_api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key missing. Please add it in API Settings.")
-
-    # fetch pdf doc
-    pdf_doc = await embedding_collection.find_one({"_id": ObjectId(pdf_id), "user_id": str(current_user["_id"])})
-    if not pdf_doc:
-        raise HTTPException(status_code=404, detail="PDF not found for this user")
-
-    chunks = pdf_doc.get("chunks", [])
-    embeddings = np.array(pdf_doc.get("embeddings", []))
-    if embeddings.size == 0:
-        raise HTTPException(status_code=500, detail="No embeddings found for this document")
-
     try:
-        # embed question with user's key
-        embeddings_client = OpenAIEmbeddings(model="text-embedding-3-small", api_key=user_api_key)
-        query_emb = embeddings_client.embed_query(question)
+        # 💬 1. Handle greetings and casual talk directly
+        lower_q = question.lower().strip()
+        common_phrases = {
+            "hi": "Hey there! 👋 How can I help you today?",
+            "hello": "Hello! 😊 Ask me anything about your document.",
+            "hey": "Hey! What would you like to know?",
+            "thanks": "You're very welcome! 🙏",
+            "thank you": "Happy to help! 🤝",
+            "ok": "Alright 👍",
+            "good morning": "Good morning! ☀️",
+            "good night": "Good night! 🌙",
+        }
+        for key, reply in common_phrases.items():
+            if key in lower_q:
+                return {"question": question, "answer": reply}
 
-        # similarity search (cosine)
-        sims = cosine_similarity([query_emb], embeddings)[0]
-        top_k = 3
-        idxs = np.argsort(sims)[-top_k:][::-1]
-        context = "\n\n".join([chunks[i] for i in idxs])
+        # 🧩 2. Retrieve PDF embeddings as before
+        pdf_data = await embedding_collection.find_one({
+            "_id": ObjectId(pdf_id),
+            "user_id": str(current_user["_id"])
+        })
+        if not pdf_data:
+            raise HTTPException(status_code=404, detail="PDF not found for this user")
 
-        # prepare LLM with user's key
-        llm = ChatOpenAI(api_key=user_api_key, model="gpt-4o-mini", temperature=0.2)
+        chunks = pdf_data["chunks"]
+        embeddings = np.array(pdf_data["embeddings"])
 
+        # 🧠 3. Embed the question
+        query_embedding = OpenAIEmbeddings(model="text-embedding-3-small").embed_query(question)
+        similarities = cosine_similarity([query_embedding], embeddings)[0]
+        top_indices = np.argsort(similarities)[-3:][::-1]
+        context = "\n\n".join([chunks[i] for i in top_indices])
+
+        # 🧠 4. Generate intelligent answer
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
         prompt = PromptTemplate(
-            template="""
-You are a helpful assistant. Answer ONLY from the provided context. If the context is insufficient, say you don't know.
+            template="""You are a helpful assistant.
+            Answer based ONLY on the context below. If unrelated, politely say you don’t know.
 
-Context:
-{context}
+            Context:
+            {context}
 
-Question:
-{question}
-""",
-            input_variables=["context", "question"],
+            Question:
+            {question}
+            """,
+            input_variables=["context", "question"]
         )
 
         final_prompt = prompt.format(context=context, question=question)
-        llm_resp = llm.invoke(final_prompt)
-        # support different return shapes
-        answer = getattr(llm_resp, "content", None) or str(llm_resp)
+        answer = llm.invoke(final_prompt).content.strip()
 
-        # persist chat
+        # 💾 5. Save chat history
         await chat_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "pdf_id": pdf_id,
@@ -292,11 +298,11 @@ Question:
             "timestamp": datetime.utcnow()
         })
 
-        return {"question": question, "answer": answer}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        return {"question": question, "answer": answer or "Sorry, I couldn't find that in the document."}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ---------------- chat history ----------------
