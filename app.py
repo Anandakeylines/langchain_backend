@@ -163,80 +163,121 @@ async def get_api_key(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------- upload pdf (create embeddings) ----------------
+from concurrent.futures import ThreadPoolExecutor
+import aiofiles
+import tempfile
+import asyncio
+
+import math
+from bson import ObjectId
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import aiofiles
+import tempfile
+
 @app.post("/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     """
-    Upload a PDF -> extract text -> embed with user's OpenAI key -> save chunks+embeddings
+    Upload a PDF safely, split embeddings into smaller MongoDB documents (<16MB each)
     """
-    # ensure user has API key
     user_api_key = current_user.get("openai_api_key")
-    # If you want fallback to a global key (NOT recommended), uncomment and use GLOBAL_OPENAI_API_KEY:
-    # if not user_api_key and FALLBACK_TO_GLOBAL_KEY:
-    #     user_api_key = GLOBAL_OPENAI_API_KEY
-
     if not user_api_key:
         raise HTTPException(status_code=400, detail="OpenAI API key missing. Please add it in API Settings.")
 
-    # write temp file
-    tmp_path = f"tmp_{datetime.utcnow().timestamp()}_{file.filename}"
-    try:
-        data = await file.read()
-        with open(tmp_path, "wb") as fh:
-            fh.write(data)
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, f"{datetime.utcnow().timestamp()}_{file.filename}")
 
-        # load and split
+    try:
+        # ✅ Stream the file to disk
+        async with aiofiles.open(tmp_path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):  # 1MB at a time
+                await out.write(chunk)
+
+        # ✅ Load and split
         loader = PyPDFLoader(tmp_path)
         pages = loader.load()
-        text = " ".join([p.page_content for p in pages])
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.create_documents([text])
+        chunks = splitter.create_documents([p.page_content for p in pages])
 
-        # create embeddings with user's key
         embeddings_client = OpenAIEmbeddings(model="text-embedding-3-small", api_key=user_api_key)
-        embedded_vectors = [embeddings_client.embed_query(c.page_content) for c in chunks]
+        texts = [c.page_content for c in chunks]
 
-        doc = {
-            "user_id": str(current_user["_id"]),
-            "filename": file.filename,
-            "upload_time": datetime.utcnow(),
-            "chunks": [c.page_content for c in chunks],
-            "embeddings": embedded_vectors,
-        }
-        res = await embedding_collection.insert_one(doc)
-        return {"message": "Embeddings saved successfully", "pdf_id": str(res.inserted_id)}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # ✅ Async batch embedding to avoid rate limits
+        async def embed_batch(batch):
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as pool:
+                return await loop.run_in_executor(pool, lambda: [embeddings_client.embed_query(t) for t in batch])
+
+        batch_size = 50
+        pdf_group_id = str(ObjectId())  # group ID for this PDF
+        total_batches = math.ceil(len(texts) / batch_size)
+
+        for i in range(total_batches):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, len(texts))
+            batch_texts = texts[start:end]
+            batch_embeddings = await embed_batch(batch_texts)
+
+            # Save each batch separately to prevent BSON > 16MB
+            await embedding_collection.insert_one({
+                "pdf_group_id": pdf_group_id,
+                "user_id": str(current_user["_id"]),
+                "filename": file.filename,
+                "upload_time": datetime.utcnow(),
+                "batch_index": i,
+                "chunks": batch_texts,
+                "embeddings": batch_embeddings,
+            })
+
+        return {"message": f"✅ Uploaded successfully in {total_batches} batches", "pdf_group_id": pdf_group_id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ---------------- list user pdfs ----------------
 @app.get("/user_pdfs")
 async def get_user_pdfs(current_user: dict = Depends(get_current_user)):
+    """
+    Return unique list of uploaded PDFs (grouped by pdf_group_id)
+    """
     cursor = embedding_collection.find({"user_id": str(current_user["_id"])})
-    out = []
-    async for d in cursor:
-        out.append({"id": str(d["_id"]), "filename": d.get("filename"), "upload_time": d.get("upload_time")})
-    return {"pdfs": out}
+    pdfs_dict = {}
+
+    async for doc in cursor:
+        # Get group ID or fallback to legacy _id
+        pdf_group_id = doc.get("pdf_group_id") or str(doc["_id"])
+        filename = doc.get("filename")
+        upload_time = doc.get("upload_time")
+
+        # Keep the earliest upload time per PDF group
+        if pdf_group_id not in pdfs_dict:
+            pdfs_dict[pdf_group_id] = {
+                "id": pdf_group_id,
+                "filename": filename,
+                "upload_time": upload_time
+            }
+
+    # Sort by upload time (newest first)
+    pdfs = sorted(pdfs_dict.values(), key=lambda x: x["upload_time"], reverse=True)
+    return {"pdfs": pdfs}
+
 
 
 # ---------------- chat with selected pdf ----------------
 @app.post("/chat")
 async def chat_with_pdf(
     question: str = Form(...),
-    pdf_id: str = Form(...),
+    pdf_id: str = Form(...),   # this is now pdf_group_id
     current_user: dict = Depends(get_current_user)
 ):
     """
     Steps:
       - Handle small-talk greetings instantly
-      - Load stored chunks + embeddings for pdf_id
+      - Load all chunks + embeddings from pdf_group_id
       - Embed question using user's OpenAI API key
       - Retrieve top-k chunks (cosine similarity)
       - Call LLM (ChatOpenAI) using user's key
@@ -250,7 +291,7 @@ async def chat_with_pdf(
             detail="❌ OpenAI API key missing. Please add it in API Settings."
         )
 
-    # 🗣️ Step 1: Handle small talk (hi, hello, ok, thanks, etc.)
+    # 🗣️ Step 1: Handle small talk
     lower_q = question.lower().strip()
     casual_replies = {
         "hi": "Hey there! 👋 How can I help you today?",
@@ -268,21 +309,24 @@ async def chat_with_pdf(
         if key in lower_q:
             return {"question": question, "answer": reply}
 
-    # 🧠 Step 2: Fetch PDF document
-    pdf_doc = await embedding_collection.find_one({
-        "_id": ObjectId(pdf_id),
+    # 🧠 Step 2: Load all PDF chunks for this group
+    cursor = embedding_collection.find({
+        "pdf_group_id": pdf_id,
         "user_id": str(current_user["_id"])
     })
-    if not pdf_doc:
-        raise HTTPException(status_code=404, detail="PDF not found for this user")
 
-    chunks = pdf_doc.get("chunks", [])
-    embeddings = np.array(pdf_doc.get("embeddings", []))
-    if embeddings.size == 0:
-        raise HTTPException(status_code=500, detail="No embeddings found for this document")
+    chunks, embeddings = [], []
+    async for doc in cursor:
+        chunks.extend(doc.get("chunks", []))
+        embeddings.extend(doc.get("embeddings", []))
+
+    if not chunks or not embeddings:
+        raise HTTPException(status_code=404, detail="No embeddings found for this PDF.")
+
+    embeddings = np.array(embeddings)
 
     try:
-        # 🔍 Step 3: Embed question with user's key
+        # 🔍 Step 3: Embed the user's question
         embeddings_client = OpenAIEmbeddings(
             model="text-embedding-3-small",
             api_key=user_api_key
@@ -303,7 +347,7 @@ async def chat_with_pdf(
                 "answer": "🤔 That question doesn’t seem related to your document. Try asking something based on its content!"
             }
 
-        # 💬 Step 6: Generate response using LLM
+        # 💬 Step 6: Query LLM
         llm = ChatOpenAI(
             api_key=user_api_key,
             model="gpt-4o-mini",
@@ -312,8 +356,8 @@ async def chat_with_pdf(
 
         prompt = PromptTemplate(
             template="""
-You are a helpful assistant. Use the provided context to answer the user's question.
-If the answer isn't in the context, politely say you don't know.
+You are a helpful assistant. Use ONLY the provided context to answer the user's question.
+If the context is insufficient, say you don't know.
 
 Context:
 {context}
@@ -331,7 +375,7 @@ Question:
         # 💾 Step 7: Save chat history
         await chat_collection.insert_one({
             "user_id": str(current_user["_id"]),
-            "pdf_id": pdf_id,
+            "pdf_group_id": pdf_id,
             "question": question,
             "answer": answer,
             "timestamp": datetime.utcnow()
@@ -343,7 +387,6 @@ Question:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 # ---------------- chat history ----------------
 @app.get("/chat_history/{pdf_id}")
