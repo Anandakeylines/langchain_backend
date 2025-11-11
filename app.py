@@ -228,51 +228,21 @@ async def get_user_pdfs(current_user: dict = Depends(get_current_user)):
 
 # ---------------- chat with selected pdf ----------------
 @app.post("/chat")
-async def chat_with_pdf(
-    question: str = Form(...),
-    pdf_id: str = Form(...),
-    current_user: dict = Depends(get_current_user)
-):
+async def chat_with_pdf(question: str = Form(...), pdf_id: str = Form(...), current_user: dict = Depends(get_current_user)):
     """
     Steps:
-      - Handle small-talk greetings instantly
-      - Load stored chunks + embeddings for pdf_id
-      - Embed question using user's OpenAI API key
-      - Retrieve top-k chunks (cosine similarity)
-      - Call LLM (ChatOpenAI) using user's key
-      - Save chat history
+      - load stored chunks+embeddings for pdf_id
+      - embed question using user's key
+      - retrieve top-k chunks (cosine)
+      - call LLM (ChatOpenAI) using user's key with prompt + context
+      - save chat history
     """
-
     user_api_key = current_user.get("openai_api_key")
     if not user_api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="❌ OpenAI API key missing. Please add it in API Settings."
-        )
+        raise HTTPException(status_code=400, detail="OpenAI API key missing. Please add it in API Settings.")
 
-    # 🗣️ Step 1: Handle small talk (hi, hello, ok, thanks, etc.)
-    lower_q = question.lower().strip()
-    casual_replies = {
-        "hi": "Hey there! 👋 How can I help you today?",
-        "hello": "Hello! 😊 Ask me anything about your document.",
-        "hey": "Hey! What would you like to explore today?",
-        "thanks": "You're very welcome! 🙏",
-        "thank you": "Happy to help! 🤝",
-        "ok": "Alright 👍",
-        "good morning": "Good morning ☀️ Ready to learn something new?",
-        "good night": "Good night 🌙 Sleep well!",
-        "how are you": "I'm just lines of code, but I'm doing great! How about you?",
-    }
-
-    for key, reply in casual_replies.items():
-        if key in lower_q:
-            return {"question": question, "answer": reply}
-
-    # 🧠 Step 2: Fetch PDF document
-    pdf_doc = await embedding_collection.find_one({
-        "_id": ObjectId(pdf_id),
-        "user_id": str(current_user["_id"])
-    })
+    # fetch pdf doc
+    pdf_doc = await embedding_collection.find_one({"_id": ObjectId(pdf_id), "user_id": str(current_user["_id"])})
     if not pdf_doc:
         raise HTTPException(status_code=404, detail="PDF not found for this user")
 
@@ -282,38 +252,22 @@ async def chat_with_pdf(
         raise HTTPException(status_code=500, detail="No embeddings found for this document")
 
     try:
-        # 🔍 Step 3: Embed question with user's key
-        embeddings_client = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            api_key=user_api_key
-        )
+        # embed question with user's key
+        embeddings_client = OpenAIEmbeddings(model="text-embedding-3-small", api_key=user_api_key)
         query_emb = embeddings_client.embed_query(question)
 
-        # 📏 Step 4: Compute cosine similarity
+        # similarity search (cosine)
         sims = cosine_similarity([query_emb], embeddings)[0]
         top_k = 3
         idxs = np.argsort(sims)[-top_k:][::-1]
         context = "\n\n".join([chunks[i] for i in idxs])
-        max_sim = float(np.max(sims)) if len(sims) else 0.0
 
-        # 🧠 Step 5: Handle irrelevant questions (low similarity)
-        if max_sim < 0.25:
-            return {
-                "question": question,
-                "answer": "🤔 That question doesn’t seem related to your document. Try asking something based on its content!"
-            }
-
-        # 💬 Step 6: Generate response using LLM
-        llm = ChatOpenAI(
-            api_key=user_api_key,
-            model="gpt-4o-mini",
-            temperature=0.2
-        )
+        # prepare LLM with user's key
+        llm = ChatOpenAI(api_key=user_api_key, model="gpt-4o-mini", temperature=0.2)
 
         prompt = PromptTemplate(
             template="""
-You are a helpful assistant. Use the provided context to answer the user's question.
-If the answer isn't in the context, politely say you don't know.
+You are a helpful assistant. Answer ONLY from the provided context. If the context is insufficient, say you don't know.
 
 Context:
 {context}
@@ -321,14 +275,15 @@ Context:
 Question:
 {question}
 """,
-            input_variables=["context", "question"]
+            input_variables=["context", "question"],
         )
 
         final_prompt = prompt.format(context=context, question=question)
         llm_resp = llm.invoke(final_prompt)
+        # support different return shapes
         answer = getattr(llm_resp, "content", None) or str(llm_resp)
 
-        # 💾 Step 7: Save chat history
+        # persist chat
         await chat_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "pdf_id": pdf_id,
@@ -338,7 +293,6 @@ Question:
         })
 
         return {"question": question, "answer": answer}
-
     except HTTPException:
         raise
     except Exception as exc:
