@@ -21,6 +21,7 @@ langchain-openai==0.1.17
 langchain-text-splitters==0.2.2
 openai==1.50.2
 #tiktoken==0.6.0
+aiofiles
 
 # ---------------- PDF Processing ----------------
 pypdf==4.3.1
